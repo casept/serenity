@@ -48,15 +48,6 @@ Because there is no such option present, this is a workaround to use
 the environment variable `SERENITY_INSTALL_ROOT` as a fake `--sysroot`
 in the detection code.
 
-## `0006-Workaround-for-unsupported-socket-option.patch`
-
-Workaround for unsupported socket option
-
-This is a workaround for ignoring the result of `setsockopt` call when
-given `TCP_NODELAY` as an argument. This TCP socket option is used in
-many applications (like pip and requests) for optimization purposes.
-For now, it can be safely ignored until it's supported in the kernel.
-
 ## `0007-Set-name-of-shared-libpython.patch`
 
 Set name of shared libpython
