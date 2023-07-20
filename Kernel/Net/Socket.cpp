@@ -78,8 +78,10 @@ ErrorOr<void> Socket::setsockopt(int level, int option, Userspace<void const*> u
 {
     MutexLocker locker(mutex());
 
-    if (level != SOL_SOCKET)
+    if (level != SOL_SOCKET) {
+        dbgln("Unknown socket level {}", level);
         return ENOPROTOOPT;
+    }
     VERIFY(level == SOL_SOCKET);
     switch (option) {
     case SO_SNDTIMEO:
@@ -143,7 +145,7 @@ ErrorOr<void> Socket::getsockopt(OpenFileDescription&, int level, int option, Us
     socklen_t size;
     TRY(copy_from_user(&size, value_size.unsafe_userspace_ptr()));
 
-    // FIXME: Add TCP_NODELAY, IPPROTO_TCP and IPPROTO_IP (used in OpenSSH)
+    // Other levels are handled further down the inheritance hierarchy
     if (level != SOL_SOCKET) {
         // Not sure if this is the correct error code, but it's only temporary until other levels are implemented.
         return ENOPROTOOPT;
@@ -301,5 +303,4 @@ void Socket::set_acceptor(Process const& process)
     auto credentials = process.credentials();
     m_acceptor = { process.pid().value(), credentials->uid().value(), credentials->gid().value() };
 }
-
 }

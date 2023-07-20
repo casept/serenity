@@ -6,6 +6,7 @@
 
 #include <AK/Singleton.h>
 #include <AK/Time.h>
+#include <Kernel/API/POSIX/netinet/tcp.h>
 #include <Kernel/Debug.h>
 #include <Kernel/Devices/Generic/RandomDevice.h>
 #include <Kernel/FileSystem/OpenFileDescription.h>
@@ -36,6 +37,54 @@ ErrorOr<void> TCPSocket::try_for_each(Function<ErrorOr<void>(TCPSocket const&)> 
             TRY(callback(*it.value));
         return {};
     });
+}
+
+ErrorOr<void> TCPSocket::getsockopt(OpenFileDescription& description, int level, int option, Userspace<void*> value, Userspace<socklen_t*> value_size)
+{
+    if (level != IPPROTO_TCP)
+        return IPv4Socket::getsockopt(description, level, option, value, value_size);
+
+    MutexLocker locker(mutex());
+
+    socklen_t size;
+    TRY(copy_from_user(&size, value_size.unsafe_userspace_ptr()));
+
+    switch (option) {
+    case TCP_NODELAY: {
+        if (size < sizeof(int))
+            return EINVAL;
+        int nodelay = static_cast<int>(m_nodelay);
+        TRY(copy_to_user(static_ptr_cast<int*>(value), (int*)&nodelay));
+        size = sizeof(int);
+        return copy_to_user(value_size, &size);
+    }
+    default:
+        return ENOPROTOOPT;
+    }
+}
+
+ErrorOr<void> TCPSocket::setsockopt(int level, int option, Userspace<void const*> user_value, socklen_t user_value_size)
+{
+    if (level != IPPROTO_TCP)
+        return IPv4Socket::setsockopt(level, option, user_value, user_value_size);
+
+    MutexLocker locker(mutex());
+
+    switch (option) {
+    case TCP_NODELAY: {
+        if (user_value_size < sizeof(int))
+            return EINVAL;
+        int value;
+        // TODO: Verify that standard says 0 and 1 are only valid values
+        TRY(copy_from_user(&value, static_ptr_cast<int const*>(user_value)));
+        if (value != 0 && value != 1)
+            return EINVAL;
+        m_nodelay = (value != 0);
+        return {};
+    }
+    default:
+        return ENOPROTOOPT;
+    }
 }
 
 bool TCPSocket::unref() const
@@ -170,6 +219,7 @@ TCPSocket::TCPSocket(int protocol, NonnullOwnPtr<DoubleBuffer> receive_buffer, N
 
 TCPSocket::~TCPSocket()
 {
+    // TODO: Think about what to do with unsent data due to nagle's
     dequeue_for_retransmit();
 
     dbgln_if(TCP_SOCKET_DEBUG, "~TCPSocket in state {}", to_string(state()));
@@ -200,15 +250,48 @@ ErrorOr<size_t> TCPSocket::protocol_receive(ReadonlyBytes raw_ipv4_packet, UserO
     return payload_size;
 }
 
+ErrorOr<void> TCPSocket::send_nagle_buf(u16 flags, RoutingDecision* routing_decision)
+{
+    if (!m_nagle_buf.is_empty()) {
+        dbgln_if(TCP_SOCKET_DEBUG, "TCPSocket: Sending {} buffered bytes", m_nagle_buf.size());
+        auto buf = UserOrKernelBuffer::for_kernel_buffer(m_nagle_buf.span().data());
+        TRY(send_tcp_packet(flags, &buf, m_nagle_buf.size(), routing_decision));
+        // It's critical to only clear this buffer here, as that way we get the ability to retry if anything above failed
+        m_nagle_buf.clear_with_capacity();
+    }
+    return {};
+}
+
 ErrorOr<size_t> TCPSocket::protocol_send(UserOrKernelBuffer const& data, size_t data_length)
 {
     auto adapter = bound_interface().with([](auto& bound_device) -> RefPtr<NetworkAdapter> { return bound_device; });
     RoutingDecision routing_decision = route_to(peer_address(), local_address(), adapter);
     if (routing_decision.is_zero())
         return set_so_error(EHOSTUNREACH);
+
     size_t mss = routing_decision.adapter->mtu() - sizeof(IPv4Packet) - sizeof(TCPPacket);
-    data_length = min(data_length, mss);
-    TRY(send_tcp_packet(TCPFlags::PSH | TCPFlags::ACK, &data, data_length, &routing_decision));
+    TRY(m_nagle_buf.try_ensure_capacity(mss));
+    size_t free = mss - m_nagle_buf.size();
+    data_length = min(data_length, free);
+    TRY(data.read_buffered<128>(data_length, [&](ReadonlyBytes data) {
+        auto err = m_nagle_buf.try_extend(Vector<u8>(data.slice(0, data.size())));
+        if (err.is_error()) {
+            return ErrorOr<size_t>(err.release_error());
+        }
+        return ErrorOr<size_t>(data.size());
+    }));
+
+    bool everything_acked = false;
+    m_unacked_packets.with_shared([&](auto& unacked_packets) {
+        everything_acked = unacked_packets.packets.is_empty();
+    });
+    bool have_enough_data = m_send_window_size >= mss && m_nagle_buf.size() >= mss;
+    bool delay = !m_nodelay && !everything_acked && !have_enough_data;
+    if (delay) {
+        dbgln_if(TCP_SOCKET_DEBUG, "TCPSocket: Delaying send of {} bytes until we have {} bytes or ACK", m_nagle_buf.size(), mss);
+    } else {
+        TRY(send_nagle_buf(TCPFlags::PSH | TCPFlags::ACK, &routing_decision));
+    }
     return data_length;
 }
 
@@ -310,7 +393,7 @@ void TCPSocket::receive_tcp_packet(TCPPacket const& packet, u16 size)
         dbgln_if(TCP_SOCKET_DEBUG, "TCPSocket: receive_tcp_packet: {}", ack_number);
 
         int removed = 0;
-        m_unacked_packets.with_exclusive([&](auto& unacked_packets) {
+        auto try_send_err = m_unacked_packets.with_exclusive([&](auto& unacked_packets) {
             while (!unacked_packets.packets.is_empty()) {
                 auto& packet = unacked_packets.packets.first();
 
@@ -337,10 +420,29 @@ void TCPSocket::receive_tcp_packet(TCPPacket const& packet, u16 size)
             if (unacked_packets.packets.is_empty()) {
                 m_retransmit_attempts = 0;
                 dequeue_for_retransmit();
+
+                // Nagle's algorithm mandates we try to send buffered data once everything we sent before has been ACK'd
+                if (!m_nagle_buf.is_empty()) {
+                    auto adapter = bound_interface().with([](auto& bound_device) -> RefPtr<NetworkAdapter> { return bound_device; });
+                    RoutingDecision routing_decision = route_to(peer_address(), local_address(), adapter);
+                    if (routing_decision.is_zero())
+                        return ErrorOr<void>(set_so_error(EHOSTUNREACH));
+                    dbgln_if(TCP_SOCKET_DEBUG, "TCPSocket: Sending buffered data now that everything has been ACK'ed");
+                    auto err = send_nagle_buf(TCPFlags::PSH | TCPFlags::ACK, &routing_decision);
+                    if (err.is_error()) {
+                        return err;
+                    }
+                }
             }
 
             dbgln_if(TCP_SOCKET_DEBUG, "TCPSocket: receive_tcp_packet acknowledged {} packets", removed);
+            return ErrorOr<void>();
         });
+
+        // Our caller is infallible, so probably better to handle this non-critical failure locally
+        if (try_send_err.is_error()) {
+            dbgln("TCPSocket: Failed to transmit buffered data after receiving ACK, will try again when more data is sent (Error: {})", try_send_err.error().code());
+        }
     }
 
     m_packets_in++;

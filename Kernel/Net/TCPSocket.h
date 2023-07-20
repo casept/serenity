@@ -10,6 +10,7 @@
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/SinglyLinkedList.h>
+#include <AK/Vector.h>
 #include <Kernel/Library/LockWeakPtr.h>
 #include <Kernel/Locking/MutexProtected.h>
 #include <Kernel/Net/IPv4Socket.h>
@@ -23,6 +24,8 @@ public:
     static ErrorOr<NonnullRefPtr<TCPSocket>> try_create(int protocol, NonnullOwnPtr<DoubleBuffer> receive_buffer);
     virtual ~TCPSocket() override;
 
+    virtual ErrorOr<void> setsockopt(int level, int option, Userspace<void const*>, socklen_t) override;
+    virtual ErrorOr<void> getsockopt(OpenFileDescription&, int level, int option, Userspace<void*>, Userspace<socklen_t*>) override;
     virtual bool unref() const override;
 
     enum class Direction {
@@ -127,6 +130,7 @@ public:
 
     void set_ack_number(u32 n) { m_ack_number = n; }
     void set_sequence_number(u32 n) { m_sequence_number = n; }
+    void set_nodelay(bool nodelay) { m_nodelay = nodelay; }
     u32 ack_number() const { return m_ack_number; }
     u32 sequence_number() const { return m_sequence_number; }
     u32 packets_in() const { return m_packets_in; }
@@ -141,6 +145,7 @@ public:
 
     ErrorOr<void> send_ack(bool allow_duplicate = false);
     ErrorOr<void> send_tcp_packet(u16 flags, UserOrKernelBuffer const* = nullptr, size_t = 0, RoutingDecision* = nullptr);
+    ErrorOr<void> send_nagle_buf(u16 flags, RoutingDecision* = nullptr);
     void receive_tcp_packet(TCPPacket const&, u16 size);
 
     bool should_delay_next_ack() const;
@@ -197,6 +202,8 @@ private:
     u32 m_bytes_in { 0 };
     u32 m_packets_out { 0 };
     u32 m_bytes_out { 0 };
+    bool m_nodelay { false };
+    Vector<u8> m_nagle_buf {};
 
     struct OutgoingPacket {
         u32 ack_number { 0 };
